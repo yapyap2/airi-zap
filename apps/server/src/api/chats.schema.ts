@@ -1,4 +1,4 @@
-import { array, literal, number, object, optional, string, union } from 'valibot'
+import { array, integer, literal, maxValue, minValue, number, object, optional, pipe, string, union } from 'valibot'
 
 const ChatTypeSchema = union([
   literal('private'),
@@ -42,4 +42,24 @@ export const ChatSyncSchema = object({
     characterId: optional(string()),
   }))),
   messages: array(ChatSyncMessageSchema),
+})
+
+const PositiveTimestampSchema = pipe(number(), minValue(0))
+
+const ChatListLimitSchema = pipe(number(), integer(), minValue(1), maxValue(200))
+const ChatSnapshotLimitSchema = pipe(number(), integer(), minValue(1), maxValue(1000))
+
+export const ChatListQuerySchema = object({
+  limit: optional(ChatListLimitSchema),
+  beforeUpdatedAt: optional(PositiveTimestampSchema),
+})
+
+export const ChatSnapshotQuerySchema = object({
+  limit: optional(ChatSnapshotLimitSchema),
+  beforeCreatedAt: optional(PositiveTimestampSchema),
+})
+
+export const ChatMessagesQuerySchema = object({
+  limit: optional(ChatSnapshotLimitSchema),
+  beforeCreatedAt: optional(PositiveTimestampSchema),
 })

@@ -1,7 +1,7 @@
 import type * as fullSchema from '../schemas'
 import type { Database } from './db'
 
-import { and, eq } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm'
 
 import { createConflictError, createForbiddenError } from '../utils/error'
 
@@ -36,6 +36,21 @@ interface SyncChatPayload {
   messages: SyncChatMessagePayload[]
 }
 
+interface ChatListOptions {
+  limit?: number
+  beforeUpdatedAt?: number
+}
+
+interface ChatSnapshotOptions {
+  limit?: number
+  beforeCreatedAt?: number
+}
+
+interface ChatMessagesOptions {
+  limit?: number
+  beforeCreatedAt?: number
+}
+
 function resolveSenderId(role: MessageRole, userId: string, characterId?: string) {
   if (role === 'user')
     return userId
@@ -47,6 +62,41 @@ function pickCharacterId(members: SyncChatMemberPayload[] | undefined) {
 }
 
 export function createChatService(db: Database<typeof fullSchema>) {
+  async function ensureChatMembership(userId: string, chatId: string) {
+    const member = await db.query.chatMembers.findFirst({
+      where: and(
+        eq(schema.chatMembers.chatId, chatId),
+        eq(schema.chatMembers.memberType, 'user'),
+        eq(schema.chatMembers.userId, userId),
+      ),
+    })
+
+    if (!member)
+      throw createForbiddenError()
+  }
+
+  async function listChatMessagesByCursor(chatId: string, options: ChatMessagesOptions = {}) {
+    const limit = Math.min(Math.max(options.limit ?? 200, 1), 1000)
+    const messages = await db.query.messages.findMany({
+      where: and(
+        eq(schema.messages.chatId, chatId),
+        isNull(schema.messages.deletedAt),
+        options.beforeCreatedAt
+          ? lt(schema.messages.createdAt, new Date(options.beforeCreatedAt))
+          : undefined,
+      ),
+      orderBy: desc(schema.messages.createdAt),
+      limit,
+    })
+
+    return messages.reverse().map(message => ({
+      id: message.id,
+      role: message.role as MessageRole,
+      content: message.content,
+      createdAt: message.createdAt.getTime(),
+    }))
+  }
+
   return {
     async syncChat(userId: string, payload: SyncChatPayload) {
       return await db.transaction(async (tx) => {
@@ -165,6 +215,95 @@ export function createChatService(db: Database<typeof fullSchema>) {
 
         return { chatId }
       })
+    },
+
+    async listChats(userId: string, options: ChatListOptions = {}) {
+      const limit = Math.min(Math.max(options.limit ?? 50, 1), 200)
+
+      const chats = await db.select({
+        id: schema.chats.id,
+        type: schema.chats.type,
+        title: schema.chats.title,
+        createdAt: schema.chats.createdAt,
+        updatedAt: schema.chats.updatedAt,
+      })
+        .from(schema.chats)
+        .innerJoin(schema.chatMembers, and(
+          eq(schema.chatMembers.chatId, schema.chats.id),
+          eq(schema.chatMembers.memberType, 'user'),
+          eq(schema.chatMembers.userId, userId),
+        ))
+        .where(and(
+          isNull(schema.chats.deletedAt),
+          options.beforeUpdatedAt
+            ? lt(schema.chats.updatedAt, new Date(options.beforeUpdatedAt))
+            : undefined,
+        ))
+        .orderBy(desc(schema.chats.updatedAt))
+        .limit(limit)
+
+      if (chats.length === 0)
+        return []
+
+      const chatIds = chats.map(chat => chat.id)
+      const members = await db.query.chatMembers.findMany({
+        where: inArray(schema.chatMembers.chatId, chatIds),
+      })
+
+      const membersByChat = members.reduce<Record<string, { characterId?: string }>>((acc, member) => {
+        if (!acc[member.chatId])
+          acc[member.chatId] = {}
+        if (member.memberType === 'character' && member.characterId)
+          acc[member.chatId].characterId = member.characterId
+        return acc
+      }, {})
+
+      return chats.map(chat => ({
+        id: chat.id,
+        type: chat.type,
+        title: chat.title,
+        createdAt: chat.createdAt.getTime(),
+        updatedAt: chat.updatedAt.getTime(),
+        characterId: membersByChat[chat.id]?.characterId,
+      }))
+    },
+
+    async getChatSnapshot(userId: string, chatId: string, options: ChatSnapshotOptions = {}) {
+      await ensureChatMembership(userId, chatId)
+
+      const chat = await db.query.chats.findFirst({
+        where: and(
+          eq(schema.chats.id, chatId),
+          isNull(schema.chats.deletedAt),
+        ),
+      })
+
+      if (!chat)
+        return null
+
+      const members = await db.query.chatMembers.findMany({
+        where: eq(schema.chatMembers.chatId, chatId),
+      })
+
+      const messages = await listChatMessagesByCursor(chatId, options)
+      const characterMember = members.find(member => member.memberType === 'character' && member.characterId)
+
+      return {
+        chat: {
+          id: chat.id,
+          type: chat.type,
+          title: chat.title,
+          createdAt: chat.createdAt.getTime(),
+          updatedAt: chat.updatedAt.getTime(),
+          characterId: characterMember?.characterId,
+        },
+        messages,
+      }
+    },
+
+    async listChatMessages(userId: string, chatId: string, options: ChatMessagesOptions = {}) {
+      await ensureChatMembership(userId, chatId)
+      return await listChatMessagesByCursor(chatId, options)
     },
   }
 }

@@ -11,6 +11,20 @@ import { chatSessionsRepo } from '../../database/repos/chat-sessions.repo'
 import { useAuthStore } from '../auth'
 import { useAiriCardStore } from '../modules/airi-card'
 
+
+interface RemoteChatMeta {
+  id: string
+  title?: string | null
+  createdAt: number
+  updatedAt: number
+  characterId?: string
+}
+
+interface RemoteChatSnapshot {
+  chat: RemoteChatMeta
+  messages: Array<{ id: string, role: ChatHistoryItem['role'], content: string, createdAt: number }>
+}
+
 export const useChatSessionStore = defineStore('chat-session', () => {
   const { userId, isAuthenticated } = storeToRefs(useAuthStore())
   const { activeCardId, systemPrompt } = storeToRefs(useAiriCardStore())
@@ -192,12 +206,147 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       sessionGenerations.value[sessionId] = 0
   }
 
+
   async function loadIndexForUser(currentUserId: string) {
     const stored = await chatSessionsRepo.getIndex(currentUserId)
     index.value = stored ?? {
       userId: currentUserId,
       characters: {},
     }
+  }
+
+  function upsertMetaIntoIndex(meta: ChatSessionMeta) {
+    if (!index.value)
+      return
+
+    const characterIndex = index.value.characters[meta.characterId] ?? {
+      activeSessionId: meta.sessionId,
+      sessions: {},
+    }
+
+    const existingMeta = characterIndex.sessions[meta.sessionId]
+    if (!existingMeta || existingMeta.updatedAt <= meta.updatedAt)
+      characterIndex.sessions[meta.sessionId] = meta
+
+    if (!characterIndex.activeSessionId)
+      characterIndex.activeSessionId = meta.sessionId
+
+    index.value.characters[meta.characterId] = characterIndex
+  }
+
+  async function reconcileRemoteMeta(remoteMeta: RemoteChatMeta) {
+    const currentUserId = getCurrentUserId()
+    const characterId = remoteMeta.characterId ?? 'default'
+    const nextMeta: ChatSessionMeta = {
+      sessionId: remoteMeta.id,
+      userId: currentUserId,
+      characterId,
+      title: remoteMeta.title ?? undefined,
+      createdAt: remoteMeta.createdAt,
+      updatedAt: remoteMeta.updatedAt,
+    }
+
+    const localMeta = sessionMetas.value[nextMeta.sessionId]
+    if (!localMeta || localMeta.updatedAt <= nextMeta.updatedAt)
+      sessionMetas.value[nextMeta.sessionId] = nextMeta
+
+    upsertMetaIntoIndex(nextMeta)
+  }
+
+  async function hydrateSessionFromRemote(sessionId: string) {
+    const response = await client.api.chats[':chatId'].snapshot.$get({
+      param: { chatId: sessionId },
+      query: { limit: '500' },
+    })
+
+    if (!response.ok)
+      return
+
+    const snapshot = await response.json() as RemoteChatSnapshot
+    await reconcileRemoteMeta(snapshot.chat)
+
+    const localRecord = await chatSessionsRepo.getSession(sessionId)
+    const localUpdatedAt = localRecord?.meta.updatedAt ?? 0
+
+    if (localRecord && localUpdatedAt > snapshot.chat.updatedAt)
+      return
+
+    const normalizedMessages: ChatHistoryItem[] = snapshot.messages.map(message => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      createdAt: message.createdAt,
+    }))
+
+    const mergedMeta = sessionMetas.value[sessionId] ?? {
+      sessionId,
+      userId: getCurrentUserId(),
+      characterId: snapshot.chat.characterId ?? 'default',
+      title: snapshot.chat.title ?? undefined,
+      createdAt: snapshot.chat.createdAt,
+      updatedAt: snapshot.chat.updatedAt,
+    }
+
+    sessionMetas.value[sessionId] = mergedMeta
+    sessionMessages.value[sessionId] = normalizedMessages
+    ensureGeneration(sessionId)
+
+    const record: ChatSessionRecord = {
+      meta: mergedMeta,
+      messages: normalizedMessages,
+    }
+
+    await enqueuePersist(() => chatSessionsRepo.saveSession(sessionId, record))
+    loadedSessions.add(sessionId)
+  }
+
+
+  // NOTICE: 부트스트랩 시 단일 세션만 복원하면 캐릭터 전환/최근 세션 이동 시
+  // UX가 끊길 수 있어, 현재 캐릭터 우선 + 최신 세션 일부를 함께 preload 한다.
+  function pickBootstrapSessionIds(remoteMetas: RemoteChatMeta[], characterId: string) {
+    const ordered = [...remoteMetas]
+
+    ordered.sort((a, b) => b.updatedAt - a.updatedAt)
+
+    const picked: string[] = []
+    const currentActiveSessionId = activeSessionId.value
+    if (currentActiveSessionId)
+      picked.push(currentActiveSessionId)
+
+    const characterMatched = ordered.find(meta => (meta.characterId ?? 'default') === characterId)
+    if (characterMatched && !picked.includes(characterMatched.id))
+      picked.push(characterMatched.id)
+
+    for (const meta of ordered) {
+      if (picked.length >= 3)
+        break
+      if (!picked.includes(meta.id))
+        picked.push(meta.id)
+    }
+
+    return picked
+  }
+
+  async function pullRemoteSessions() {
+    if (!isAuthenticated.value)
+      return
+
+    const response = await client.api.chats.$get({
+      query: { limit: '200' },
+    })
+
+    if (!response.ok)
+      throw new Error('Failed to pull remote sessions')
+
+    const remoteMetas = await response.json() as RemoteChatMeta[]
+    for (const remoteMeta of remoteMetas)
+      await reconcileRemoteMeta(remoteMeta)
+
+    const bootstrapSessionIds = pickBootstrapSessionIds(remoteMetas, getCurrentCharacterId())
+    for (const sessionId of bootstrapSessionIds)
+      await hydrateSessionFromRemote(sessionId)
+
+    await persistIndex()
   }
 
   function getCharacterIndex(characterId: string) {
@@ -343,6 +492,18 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       return initializePromise
     initializing.value = true
     initializePromise = (async () => {
+      const currentUserId = getCurrentUserId()
+      await loadIndexForUser(currentUserId)
+
+      if (isAuthenticated.value) {
+        try {
+          await pullRemoteSessions()
+        }
+        catch (error) {
+          console.warn('Failed to pull remote chat sessions', error)
+        }
+      }
+
       await ensureActiveSessionForCharacter()
       ready.value = true
     })()

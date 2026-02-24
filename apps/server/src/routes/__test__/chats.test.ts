@@ -98,6 +98,30 @@ describe('chatRoutes', () => {
     expect(res.status).toBe(400)
   })
 
+
+
+  it('get /delta should return changed chats after timestamp', async () => {
+    const baselineRes = await app.fetch(new Request('http://localhost/'), { user: testUser } as any)
+    const baseline = await baselineRes.json() as any[]
+    const since = baseline[0].updatedAt - 1
+
+    const deltaRes = await app.fetch(new Request(`http://localhost/delta?sinceUpdatedAt=${since}`), { user: testUser } as any)
+    expect(deltaRes.status).toBe(200)
+    const delta = await deltaRes.json() as any
+    expect(delta.chats.some((chat: any) => chat.id === 'chat-route-1')).toBe(true)
+  })
+
+  it('delete /:chatId should tombstone chat and appear in delta', async () => {
+    const deleteRes = await app.fetch(new Request('http://localhost/chat-route-1', { method: 'DELETE' }), { user: testUser } as any)
+    expect(deleteRes.status).toBe(200)
+
+    const deleted = await deleteRes.json() as any
+    const deltaRes = await app.fetch(new Request(`http://localhost/delta?sinceUpdatedAt=${deleted.deletedAt - 1}`), { user: testUser } as any)
+    expect(deltaRes.status).toBe(200)
+    const delta = await deltaRes.json() as any
+    expect(delta.deletedChatIds).toContain('chat-route-1')
+  })
+
   it('get /:chatId/snapshot should return messages', async () => {
     const res = await app.fetch(new Request('http://localhost/chat-route-1/snapshot'), { user: testUser } as any)
     expect(res.status).toBe(200)

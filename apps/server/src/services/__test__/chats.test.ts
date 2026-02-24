@@ -69,4 +69,17 @@ describe('chatService', () => {
   it('getChatSnapshot should throw for non-member', async () => {
     await expect(service.getChatSnapshot('user-2', 'chat-1')).rejects.toThrowError()
   })
+
+
+  it('listChatDelta should include tombstoned chats', async () => {
+    const base = await service.listChats('user-1')
+    const since = base[0].updatedAt - 1
+
+    await service.softDeleteChat('user-1', 'chat-1')
+
+    const delta = await service.listChatDelta('user-1', { sinceUpdatedAt: since })
+    expect(delta.chats.some(chat => chat.id === 'chat-1' && !!chat.deletedAt)).toBe(true)
+    expect(delta.deletedChatIds).toContain('chat-1')
+  })
+
 })

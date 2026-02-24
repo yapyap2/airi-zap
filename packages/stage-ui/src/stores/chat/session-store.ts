@@ -17,6 +17,7 @@ interface RemoteChatMeta {
   title?: string | null
   createdAt: number
   updatedAt: number
+  deletedAt?: number
   characterId?: string
 }
 
@@ -44,6 +45,8 @@ export const useChatSessionStore = defineStore('chat-session', () => {
   let syncQueue = Promise.resolve()
   const loadedSessions = new Set<string>()
   const loadingSessions = new Map<string, Promise<void>>()
+  const deltaPullIntervalMs = 15 * 1000
+  let deltaPullTimer: ReturnType<typeof setInterval> | null = null
 
   // I know this nu uh, better than loading all language on rehypeShiki
   const codeBlockSystemPrompt = '- For any programming code block, always specify the programming language that supported on @shikijs/rehype on the rendered markdown, eg. ```python ... ```\n'
@@ -234,6 +237,23 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     index.value.characters[meta.characterId] = characterIndex
   }
 
+
+  function removeSessionFromIndex(sessionId: string) {
+    if (!index.value)
+      return
+
+    for (const characterIndex of Object.values(index.value.characters)) {
+      if (!characterIndex.sessions[sessionId])
+        continue
+
+      delete characterIndex.sessions[sessionId]
+      if (characterIndex.activeSessionId === sessionId) {
+        const fallback = Object.keys(characterIndex.sessions)[0]
+        characterIndex.activeSessionId = fallback ?? ''
+      }
+    }
+  }
+
   async function reconcileRemoteMeta(remoteMeta: RemoteChatMeta) {
     const currentUserId = getCurrentUserId()
     const characterId = remoteMeta.characterId ?? 'default'
@@ -244,6 +264,18 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       title: remoteMeta.title ?? undefined,
       createdAt: remoteMeta.createdAt,
       updatedAt: remoteMeta.updatedAt,
+      deletedAt: remoteMeta.deletedAt,
+    }
+
+    if (nextMeta.deletedAt) {
+      delete sessionMetas.value[nextMeta.sessionId]
+      delete sessionMessages.value[nextMeta.sessionId]
+      delete sessionGenerations.value[nextMeta.sessionId]
+      loadedSessions.delete(nextMeta.sessionId)
+      loadingSessions.delete(nextMeta.sessionId)
+      removeSessionFromIndex(nextMeta.sessionId)
+      await enqueuePersist(() => chatSessionsRepo.deleteSession(nextMeta.sessionId))
+      return
     }
 
     const localMeta = sessionMetas.value[nextMeta.sessionId]
@@ -325,6 +357,46 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     }
 
     return picked
+  }
+
+
+  async function pullChatDelta() {
+    if (!isAuthenticated.value)
+      return
+
+    const sinceUpdatedAt = Math.max(0, ...Object.values(sessionMetas.value).map(meta => meta.updatedAt || 0))
+    const response = await client.api.chats.delta.$get({
+      query: {
+        sinceUpdatedAt: String(sinceUpdatedAt),
+        limit: '200',
+      },
+    })
+
+    if (!response.ok)
+      return
+
+    const delta = await response.json() as { chats: RemoteChatMeta[], deletedChatIds: string[] }
+    for (const remoteMeta of delta.chats)
+      await reconcileRemoteMeta(remoteMeta)
+
+    await persistIndex()
+  }
+
+  function startDeltaPullLoop() {
+    if (deltaPullTimer)
+      clearInterval(deltaPullTimer)
+
+    deltaPullTimer = setInterval(() => {
+      void pullChatDelta()
+    }, deltaPullIntervalMs)
+  }
+
+  function disposeSyncLoop() {
+    if (!deltaPullTimer)
+      return
+
+    clearInterval(deltaPullTimer)
+    deltaPullTimer = null
   }
 
   async function pullRemoteSessions() {
@@ -498,6 +570,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       if (isAuthenticated.value) {
         try {
           await pullRemoteSessions()
+          startDeltaPullLoop()
         }
         catch (error) {
           console.warn('Failed to pull remote chat sessions', error)
@@ -555,6 +628,33 @@ export const useChatSessionStore = defineStore('chat-session', () => {
 
     if (ready.value)
       void loadSession(sessionId)
+  }
+
+
+  async function deleteSession(sessionId: string) {
+    const meta = sessionMetas.value[sessionId]
+    if (!meta)
+      return
+
+    if (isAuthenticated.value) {
+      const response = await client.api.chats[':chatId'].$delete({
+        param: { chatId: sessionId },
+      })
+
+      if (!response.ok)
+        throw new Error('Failed to delete chat session')
+    }
+
+    await reconcileRemoteMeta({
+      id: sessionId,
+      title: meta.title,
+      createdAt: meta.createdAt,
+      updatedAt: Date.now(),
+      deletedAt: Date.now(),
+      characterId: meta.characterId,
+    })
+
+    await persistIndex()
   }
 
   function cleanupMessages(sessionId = activeSessionId.value) {
@@ -700,6 +800,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
 
     setActiveSession,
     cleanupMessages,
+    deleteSession,
     getAllSessions,
     resetAllSessions,
 
@@ -714,5 +815,6 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     forkSession,
     exportSessions,
     importSessions,
+    disposeSyncLoop,
   }
 })

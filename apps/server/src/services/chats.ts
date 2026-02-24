@@ -1,7 +1,7 @@
 import type * as fullSchema from '../schemas'
 import type { Database } from './db'
 
-import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm'
+import { and, desc, eq, gt, inArray, isNull, lt } from 'drizzle-orm'
 
 import { createConflictError, createForbiddenError } from '../utils/error'
 
@@ -49,6 +49,11 @@ interface ChatSnapshotOptions {
 interface ChatMessagesOptions {
   limit?: number
   beforeCreatedAt?: number
+}
+
+interface ChatDeltaOptions {
+  sinceUpdatedAt: number
+  limit?: number
 }
 
 function resolveSenderId(role: MessageRole, userId: string, characterId?: string) {
@@ -226,6 +231,7 @@ export function createChatService(db: Database<typeof fullSchema>) {
         title: schema.chats.title,
         createdAt: schema.chats.createdAt,
         updatedAt: schema.chats.updatedAt,
+        deletedAt: schema.chats.deletedAt,
       })
         .from(schema.chats)
         .innerJoin(schema.chatMembers, and(
@@ -264,6 +270,7 @@ export function createChatService(db: Database<typeof fullSchema>) {
         title: chat.title,
         createdAt: chat.createdAt.getTime(),
         updatedAt: chat.updatedAt.getTime(),
+        deletedAt: chat.deletedAt?.getTime(),
         characterId: membersByChat[chat.id]?.characterId,
       }))
     },
@@ -301,6 +308,82 @@ export function createChatService(db: Database<typeof fullSchema>) {
       }
     },
 
+
+
+    async listChatDelta(userId: string, options: ChatDeltaOptions) {
+      const limit = Math.min(Math.max(options.limit ?? 200, 1), 200)
+      const since = new Date(options.sinceUpdatedAt)
+
+      const chats = await db.select({
+        id: schema.chats.id,
+        type: schema.chats.type,
+        title: schema.chats.title,
+        createdAt: schema.chats.createdAt,
+        updatedAt: schema.chats.updatedAt,
+        deletedAt: schema.chats.deletedAt,
+      })
+        .from(schema.chats)
+        .innerJoin(schema.chatMembers, and(
+          eq(schema.chatMembers.chatId, schema.chats.id),
+          eq(schema.chatMembers.memberType, 'user'),
+          eq(schema.chatMembers.userId, userId),
+        ))
+        .where(gt(schema.chats.updatedAt, since))
+        .orderBy(desc(schema.chats.updatedAt))
+        .limit(limit)
+
+      if (chats.length === 0)
+        return { chats: [], deletedChatIds: [] as string[] }
+
+      const chatIds = chats.map(chat => chat.id)
+      const members = await db.query.chatMembers.findMany({
+        where: inArray(schema.chatMembers.chatId, chatIds),
+      })
+
+      const membersByChat = members.reduce<Record<string, { characterId?: string }>>((acc, member) => {
+        if (!acc[member.chatId])
+          acc[member.chatId] = {}
+        if (member.memberType === 'character' && member.characterId)
+          acc[member.chatId].characterId = member.characterId
+        return acc
+      }, {})
+
+      const upserts = chats.map(chat => ({
+        id: chat.id,
+        type: chat.type,
+        title: chat.title,
+        createdAt: chat.createdAt.getTime(),
+        updatedAt: chat.updatedAt.getTime(),
+        deletedAt: chat.deletedAt?.getTime(),
+        characterId: membersByChat[chat.id]?.characterId,
+      }))
+
+      return {
+        chats: upserts,
+        deletedChatIds: upserts.filter(chat => chat.deletedAt).map(chat => chat.id),
+      }
+    },
+
+    async softDeleteChat(userId: string, chatId: string) {
+      await ensureChatMembership(userId, chatId)
+      const now = new Date()
+
+      await db.update(schema.chats)
+        .set({
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(schema.chats.id, chatId))
+
+      await db.update(schema.messages)
+        .set({
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(schema.messages.chatId, chatId))
+
+      return { chatId, deletedAt: now.getTime() }
+    },
     async listChatMessages(userId: string, chatId: string, options: ChatMessagesOptions = {}) {
       await ensureChatMembership(userId, chatId)
       return await listChatMessagesByCursor(chatId, options)

@@ -63,3 +63,9 @@ export const ChatMessagesQuerySchema = object({
   limit: optional(ChatSnapshotLimitSchema),
   beforeCreatedAt: optional(PositiveTimestampSchema),
 })
+
+
+export const ChatDeltaQuerySchema = object({
+  sinceUpdatedAt: PositiveTimestampSchema,
+  limit: optional(ChatListLimitSchema),
+})

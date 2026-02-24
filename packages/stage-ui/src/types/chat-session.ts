@@ -7,6 +7,7 @@ export interface ChatSessionMeta {
   title?: string
   createdAt: number
   updatedAt: number
+  deletedAt?: number
 }
 
 export interface ChatSessionRecord {

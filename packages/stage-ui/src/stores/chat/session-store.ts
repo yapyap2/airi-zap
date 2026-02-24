@@ -11,6 +11,21 @@ import { chatSessionsRepo } from '../../database/repos/chat-sessions.repo'
 import { useAuthStore } from '../auth'
 import { useAiriCardStore } from '../modules/airi-card'
 
+
+interface RemoteChatMeta {
+  id: string
+  title?: string | null
+  createdAt: number
+  updatedAt: number
+  deletedAt?: number
+  characterId?: string
+}
+
+interface RemoteChatSnapshot {
+  chat: RemoteChatMeta
+  messages: Array<{ id: string, role: ChatHistoryItem['role'], content: string, createdAt: number }>
+}
+
 export const useChatSessionStore = defineStore('chat-session', () => {
   const { userId, isAuthenticated } = storeToRefs(useAuthStore())
   const { activeCardId, systemPrompt } = storeToRefs(useAiriCardStore())
@@ -30,6 +45,8 @@ export const useChatSessionStore = defineStore('chat-session', () => {
   let syncQueue = Promise.resolve()
   const loadedSessions = new Set<string>()
   const loadingSessions = new Map<string, Promise<void>>()
+  const deltaPullIntervalMs = 15 * 1000
+  let deltaPullTimer: ReturnType<typeof setInterval> | null = null
 
   // I know this nu uh, better than loading all language on rehypeShiki
   const codeBlockSystemPrompt = '- For any programming code block, always specify the programming language that supported on @shikijs/rehype on the rendered markdown, eg. ```python ... ```\n'
@@ -192,12 +209,216 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       sessionGenerations.value[sessionId] = 0
   }
 
+
   async function loadIndexForUser(currentUserId: string) {
     const stored = await chatSessionsRepo.getIndex(currentUserId)
     index.value = stored ?? {
       userId: currentUserId,
       characters: {},
     }
+  }
+
+  function upsertMetaIntoIndex(meta: ChatSessionMeta) {
+    if (!index.value)
+      return
+
+    const characterIndex = index.value.characters[meta.characterId] ?? {
+      activeSessionId: meta.sessionId,
+      sessions: {},
+    }
+
+    const existingMeta = characterIndex.sessions[meta.sessionId]
+    if (!existingMeta || existingMeta.updatedAt <= meta.updatedAt)
+      characterIndex.sessions[meta.sessionId] = meta
+
+    if (!characterIndex.activeSessionId)
+      characterIndex.activeSessionId = meta.sessionId
+
+    index.value.characters[meta.characterId] = characterIndex
+  }
+
+
+  function removeSessionFromIndex(sessionId: string) {
+    if (!index.value)
+      return
+
+    for (const characterIndex of Object.values(index.value.characters)) {
+      if (!characterIndex.sessions[sessionId])
+        continue
+
+      delete characterIndex.sessions[sessionId]
+      if (characterIndex.activeSessionId === sessionId) {
+        const fallback = Object.keys(characterIndex.sessions)[0]
+        characterIndex.activeSessionId = fallback ?? ''
+      }
+    }
+  }
+
+  async function reconcileRemoteMeta(remoteMeta: RemoteChatMeta) {
+    const currentUserId = getCurrentUserId()
+    const characterId = remoteMeta.characterId ?? 'default'
+    const nextMeta: ChatSessionMeta = {
+      sessionId: remoteMeta.id,
+      userId: currentUserId,
+      characterId,
+      title: remoteMeta.title ?? undefined,
+      createdAt: remoteMeta.createdAt,
+      updatedAt: remoteMeta.updatedAt,
+      deletedAt: remoteMeta.deletedAt,
+    }
+
+    if (nextMeta.deletedAt) {
+      delete sessionMetas.value[nextMeta.sessionId]
+      delete sessionMessages.value[nextMeta.sessionId]
+      delete sessionGenerations.value[nextMeta.sessionId]
+      loadedSessions.delete(nextMeta.sessionId)
+      loadingSessions.delete(nextMeta.sessionId)
+      removeSessionFromIndex(nextMeta.sessionId)
+      await enqueuePersist(() => chatSessionsRepo.deleteSession(nextMeta.sessionId))
+      return
+    }
+
+    const localMeta = sessionMetas.value[nextMeta.sessionId]
+    if (!localMeta || localMeta.updatedAt <= nextMeta.updatedAt)
+      sessionMetas.value[nextMeta.sessionId] = nextMeta
+
+    upsertMetaIntoIndex(nextMeta)
+  }
+
+  async function hydrateSessionFromRemote(sessionId: string) {
+    const response = await client.api.chats[':chatId'].snapshot.$get({
+      param: { chatId: sessionId },
+      query: { limit: '500' },
+    })
+
+    if (!response.ok)
+      return
+
+    const snapshot = await response.json() as RemoteChatSnapshot
+    await reconcileRemoteMeta(snapshot.chat)
+
+    const localRecord = await chatSessionsRepo.getSession(sessionId)
+    const localUpdatedAt = localRecord?.meta.updatedAt ?? 0
+
+    if (localRecord && localUpdatedAt > snapshot.chat.updatedAt)
+      return
+
+    const normalizedMessages: ChatHistoryItem[] = snapshot.messages.map(message => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      createdAt: message.createdAt,
+    }))
+
+    const mergedMeta = sessionMetas.value[sessionId] ?? {
+      sessionId,
+      userId: getCurrentUserId(),
+      characterId: snapshot.chat.characterId ?? 'default',
+      title: snapshot.chat.title ?? undefined,
+      createdAt: snapshot.chat.createdAt,
+      updatedAt: snapshot.chat.updatedAt,
+    }
+
+    sessionMetas.value[sessionId] = mergedMeta
+    sessionMessages.value[sessionId] = normalizedMessages
+    ensureGeneration(sessionId)
+
+    const record: ChatSessionRecord = {
+      meta: mergedMeta,
+      messages: normalizedMessages,
+    }
+
+    await enqueuePersist(() => chatSessionsRepo.saveSession(sessionId, record))
+    loadedSessions.add(sessionId)
+  }
+
+
+  // NOTICE: 부트스트랩 시 단일 세션만 복원하면 캐릭터 전환/최근 세션 이동 시
+  // UX가 끊길 수 있어, 현재 캐릭터 우선 + 최신 세션 일부를 함께 preload 한다.
+  function pickBootstrapSessionIds(remoteMetas: RemoteChatMeta[], characterId: string) {
+    const ordered = [...remoteMetas]
+
+    ordered.sort((a, b) => b.updatedAt - a.updatedAt)
+
+    const picked: string[] = []
+    const currentActiveSessionId = activeSessionId.value
+    if (currentActiveSessionId)
+      picked.push(currentActiveSessionId)
+
+    const characterMatched = ordered.find(meta => (meta.characterId ?? 'default') === characterId)
+    if (characterMatched && !picked.includes(characterMatched.id))
+      picked.push(characterMatched.id)
+
+    for (const meta of ordered) {
+      if (picked.length >= 3)
+        break
+      if (!picked.includes(meta.id))
+        picked.push(meta.id)
+    }
+
+    return picked
+  }
+
+
+  async function pullChatDelta() {
+    if (!isAuthenticated.value)
+      return
+
+    const sinceUpdatedAt = Math.max(0, ...Object.values(sessionMetas.value).map(meta => meta.updatedAt || 0))
+    const response = await client.api.chats.delta.$get({
+      query: {
+        sinceUpdatedAt: String(sinceUpdatedAt),
+        limit: '200',
+      },
+    })
+
+    if (!response.ok)
+      return
+
+    const delta = await response.json() as { chats: RemoteChatMeta[], deletedChatIds: string[] }
+    for (const remoteMeta of delta.chats)
+      await reconcileRemoteMeta(remoteMeta)
+
+    await persistIndex()
+  }
+
+  function startDeltaPullLoop() {
+    if (deltaPullTimer)
+      clearInterval(deltaPullTimer)
+
+    deltaPullTimer = setInterval(() => {
+      void pullChatDelta()
+    }, deltaPullIntervalMs)
+  }
+
+  function disposeSyncLoop() {
+    if (!deltaPullTimer)
+      return
+
+    clearInterval(deltaPullTimer)
+    deltaPullTimer = null
+  }
+
+  async function pullRemoteSessions() {
+    if (!isAuthenticated.value)
+      return
+
+    const response = await client.api.chats.$get({
+      query: { limit: '200' },
+    })
+
+    if (!response.ok)
+      throw new Error('Failed to pull remote sessions')
+
+    const remoteMetas = await response.json() as RemoteChatMeta[]
+    for (const remoteMeta of remoteMetas)
+      await reconcileRemoteMeta(remoteMeta)
+
+    const bootstrapSessionIds = pickBootstrapSessionIds(remoteMetas, getCurrentCharacterId())
+    for (const sessionId of bootstrapSessionIds)
+      await hydrateSessionFromRemote(sessionId)
+
+    await persistIndex()
   }
 
   function getCharacterIndex(characterId: string) {
@@ -343,6 +564,19 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       return initializePromise
     initializing.value = true
     initializePromise = (async () => {
+      const currentUserId = getCurrentUserId()
+      await loadIndexForUser(currentUserId)
+
+      if (isAuthenticated.value) {
+        try {
+          await pullRemoteSessions()
+          startDeltaPullLoop()
+        }
+        catch (error) {
+          console.warn('Failed to pull remote chat sessions', error)
+        }
+      }
+
       await ensureActiveSessionForCharacter()
       ready.value = true
     })()
@@ -394,6 +628,33 @@ export const useChatSessionStore = defineStore('chat-session', () => {
 
     if (ready.value)
       void loadSession(sessionId)
+  }
+
+
+  async function deleteSession(sessionId: string) {
+    const meta = sessionMetas.value[sessionId]
+    if (!meta)
+      return
+
+    if (isAuthenticated.value) {
+      const response = await client.api.chats[':chatId'].$delete({
+        param: { chatId: sessionId },
+      })
+
+      if (!response.ok)
+        throw new Error('Failed to delete chat session')
+    }
+
+    await reconcileRemoteMeta({
+      id: sessionId,
+      title: meta.title,
+      createdAt: meta.createdAt,
+      updatedAt: Date.now(),
+      deletedAt: Date.now(),
+      characterId: meta.characterId,
+    })
+
+    await persistIndex()
   }
 
   function cleanupMessages(sessionId = activeSessionId.value) {
@@ -539,6 +800,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
 
     setActiveSession,
     cleanupMessages,
+    deleteSession,
     getAllSessions,
     resetAllSessions,
 
@@ -553,5 +815,6 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     forkSession,
     exportSessions,
     importSessions,
+    disposeSyncLoop,
   }
 })
